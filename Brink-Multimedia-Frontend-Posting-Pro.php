@@ -1,15 +1,15 @@
 <?php
 /**
  * Plugin Name: Brink Multimedia Frontend Posting Pro
- * Description: Versie 5.15.0 - Volledige beveiligingsaudit: CSRF/nonce-bescherming en capability-checks op alle beheeracties, rate limiting op formulieren, activatie/deactivatie-hooks, data-retentie op statistieken, en performance-optimalisaties.
- * Version: 5.15.0
+ * Description: Versie 5.15.2 - Volledige beveiligingsaudit: CSRF/nonce-bescherming en capability-checks op alle beheeracties, rate limiting op formulieren, activatie/deactivatie-hooks, data-retentie op statistieken, performance-optimalisaties en een eigen GitHub-updater.
+ * Version: 5.15.2
  * Author: Brink Multimedia
  * Update URI: false
  */
 
 if (!defined('ABSPATH')) exit;
 
-define('BRINK_FP_VERSION', '5.15.0');
+define('BRINK_FP_VERSION', '5.15.2');
 define('BRINK_FP_DB_VERSION', '1.1');
 define('BRINK_FP_GITHUB_REPO', 'Brinkmulti/frontend-posting-pro');
 
@@ -484,7 +484,7 @@ function brink_ad_dashboard_page() {
     if ($active_tab === 'advanced' || $active_tab === 'nieuws' || $active_tab === 'vacatures') wp_enqueue_media();
     ?>
     <div class="wrap">
-        <h1>Brink Multimedia Frontend Posting Pro <span style="font-size:14px; color:#666;">v5.14.3</span></h1>
+        <h1>Brink Multimedia Frontend Posting Pro <span style="font-size:14px; color:#666;">v<?php echo esc_html(BRINK_FP_VERSION); ?></span></h1>
         
         <?php
         if (isset($_GET['msg'])) {
