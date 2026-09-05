@@ -4,12 +4,14 @@
  * Description: Versie 5.15.0 - Volledige beveiligingsaudit: CSRF/nonce-bescherming en capability-checks op alle beheeracties, rate limiting op formulieren, activatie/deactivatie-hooks, data-retentie op statistieken, en performance-optimalisaties.
  * Version: 5.15.0
  * Author: Brink Multimedia
+ * Update URI: false
  */
 
 if (!defined('ABSPATH')) exit;
 
 define('BRINK_FP_VERSION', '5.15.0');
 define('BRINK_FP_DB_VERSION', '1.1');
+define('BRINK_FP_GITHUB_REPO', 'Brinkmulti/frontend-posting-pro');
 
 // BEVEILIGING (v5.15.0): bouwt de huidige URL op basis van het vertrouwde, in wp-admin
 // ingestelde home_url() in plaats van de door de client aan te leveren $_SERVER['HTTP_HOST']
@@ -52,6 +54,83 @@ function brink_fp_turnstile_async_attr($tag, $handle) {
         $tag = str_replace(' src', ' async defer src', $tag);
     }
     return $tag;
+}
+
+// ==========================================
+// 0. GITHUB UPDATER (Suite-breed, licht en zonder externe library)
+// ==========================================
+// Consistent met wp-realtime-analytics: geen plugin-update-checker of andere externe
+// dependency, maar een eigen lightweight updater die de GitHub Releases API bevraagt,
+// resultaten 12u cachet (15 min bij een mislukte call) en de zip-mapnaam corrigeert.
+add_filter('pre_set_site_transient_update_plugins', 'brink_fp_check_for_update');
+function brink_fp_check_for_update($transient) {
+    if (empty($transient) || !is_object($transient) || empty($transient->checked)) return $transient;
+
+    $plugin_file = plugin_basename(__FILE__);
+    $release = brink_fp_get_github_release();
+    if (!$release || empty($release['tag_name'])) return $transient;
+
+    $remote_version = ltrim($release['tag_name'], 'v');
+
+    if (version_compare($remote_version, BRINK_FP_VERSION, '>')) {
+        $package = !empty($release['zipball_url']) ? $release['zipball_url'] : '';
+        $transient->response[$plugin_file] = (object) array(
+            'slug'        => dirname($plugin_file),
+            'plugin'      => $plugin_file,
+            'new_version' => $remote_version,
+            'url'         => 'https://github.com/' . BRINK_FP_GITHUB_REPO,
+            'package'     => $package,
+        );
+    } else {
+        unset($transient->response[$plugin_file]);
+    }
+
+    return $transient;
+}
+
+// Haalt de laatste release van GitHub op, met caching zodat we de API niet op elke
+// admin-load bevragen (voorkomt onnodige externe HTTP-calls = performance + rate limits).
+function brink_fp_get_github_release() {
+    $cache_key = 'brink_fp_github_release';
+    $cached = get_transient($cache_key);
+    if ($cached !== false) {
+        return !empty($cached) ? $cached : false;
+    }
+
+    $response = wp_remote_get('https://api.github.com/repos/' . BRINK_FP_GITHUB_REPO . '/releases/latest', array(
+        'headers' => array('Accept' => 'application/vnd.github+json'),
+        'timeout' => 10,
+    ));
+
+    if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+        set_transient($cache_key, array(), 15 * MINUTE_IN_SECONDS);
+        return false;
+    }
+
+    $body = json_decode(wp_remote_retrieve_body($response), true);
+    if (empty($body) || !is_array($body) || empty($body['tag_name'])) {
+        set_transient($cache_key, array(), 15 * MINUTE_IN_SECONDS);
+        return false;
+    }
+
+    set_transient($cache_key, $body, 12 * HOUR_IN_SECONDS);
+    return $body;
+}
+
+// GitHub's zipball plaatst de bestanden in een map als "Brinkmulti-frontend-posting-pro-abc1234"
+// i.p.v. de verwachte pluginmap-naam. Zonder deze fix denkt WordPress dat de plugin
+// gedeactiveerd/verwijderd is na een update.
+add_filter('upgrader_source_selection', 'brink_fp_fix_github_source_dir', 10, 4);
+function brink_fp_fix_github_source_dir($source, $remote_source, $upgrader, $hook_extra) {
+    global $wp_filesystem;
+    if (!is_object($wp_filesystem)) return $source;
+    if (empty($hook_extra['plugin']) || $hook_extra['plugin'] !== plugin_basename(__FILE__)) return $source;
+
+    $correct_dir = trailingslashit($remote_source) . dirname(plugin_basename(__FILE__)) . '/';
+    if (trailingslashit($source) !== $correct_dir && $wp_filesystem->move($source, $correct_dir)) {
+        return $correct_dir;
+    }
+    return $source;
 }
 
 // ==========================================
