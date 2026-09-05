@@ -1,15 +1,15 @@
 <?php
 /**
  * Plugin Name: Brink Multimedia Frontend Posting Pro
- * Description: Versie 5.15.2 - Volledige beveiligingsaudit: CSRF/nonce-bescherming en capability-checks op alle beheeracties, rate limiting op formulieren, activatie/deactivatie-hooks, data-retentie op statistieken, performance-optimalisaties en een eigen GitHub-updater.
- * Version: 5.15.2
+ * Description: Versie 5.17.0 - Nieuwe functionaliteit: serverside zoeken/paginering in het dashboard, automatische afbeeldingscompressie, een fotogalerij per advertentie, een wekelijkse digest-mail, interesse-tracking per dag/thema, en automatische SEO meta/OG-tags.
+ * Version: 5.17.0
  * Author: Brink Multimedia
  * Update URI: false
  */
 
 if (!defined('ABSPATH')) exit;
 
-define('BRINK_FP_VERSION', '5.15.2');
+define('BRINK_FP_VERSION', '5.17.0');
 define('BRINK_FP_DB_VERSION', '1.1');
 define('BRINK_FP_GITHUB_REPO', 'Brinkmulti/frontend-posting-pro');
 
@@ -162,6 +162,16 @@ function brink_fp_maybe_upgrade_db() {
     }
 }
 
+// WP kent van zichzelf geen "weekly" interval (alleen hourly/twicedaily/daily) — nodig voor de
+// wekelijkse digest-mail hieronder.
+add_filter('cron_schedules', 'brink_fp_add_weekly_cron_schedule');
+function brink_fp_add_weekly_cron_schedule($schedules) {
+    if (!isset($schedules['weekly'])) {
+        $schedules['weekly'] = array('interval' => WEEK_IN_SECONDS, 'display' => __('Eén keer per week', 'brink-fp'));
+    }
+    return $schedules;
+}
+
 // Activatie: tabel aanmaken, standaardopties zetten, cronjobs plannen
 register_activation_hook(__FILE__, 'brink_fp_activate');
 function brink_fp_activate() {
@@ -174,6 +184,9 @@ function brink_fp_activate() {
     if (!wp_next_scheduled('brink_stats_cleanup_event')) {
         wp_schedule_event(time(), 'daily', 'brink_stats_cleanup_event');
     }
+    if (!wp_next_scheduled('brink_fp_weekly_digest_event')) {
+        wp_schedule_event(time(), 'weekly', 'brink_fp_weekly_digest_event');
+    }
 }
 
 // Deactivatie: geplande cronjobs netjes opruimen (voorkomt "spooktaken" na uitschakelen)
@@ -184,6 +197,9 @@ function brink_fp_deactivate() {
 
     $timestamp2 = wp_next_scheduled('brink_stats_cleanup_event');
     if ($timestamp2) wp_unschedule_event($timestamp2, 'brink_stats_cleanup_event');
+
+    $timestamp3 = wp_next_scheduled('brink_fp_weekly_digest_event');
+    if ($timestamp3) wp_unschedule_event($timestamp3, 'brink_fp_weekly_digest_event');
 }
 
 // Data-minimalisatie: oude statistiekregels periodiek opruimen (standaard 180 dagen, net als wp-realtime-analytics)
@@ -194,6 +210,45 @@ function brink_fp_prune_old_stats() {
     $retention_days = (int) apply_filters('brink_fp_stats_retention_days', 180);
     if ($retention_days < 30) $retention_days = 30;
     $wpdb->query($wpdb->prepare("DELETE FROM $table WHERE created_at < DATE_SUB(NOW(), INTERVAL %d DAY)", $retention_days));
+}
+
+// FUNCTIONALITEIT (v5.17.0): wekelijkse digest-mail naar de beheerder met een overzicht van de
+// afgelopen 7 dagen — zelfde soort functionaliteit als de wekelijkse stats-mail in
+// wp-realtime-analytics, hier toegepast op de formulierinzendingen van deze plugin.
+add_action('brink_fp_weekly_digest_event', 'brink_fp_send_weekly_digest');
+function brink_fp_send_weekly_digest() {
+    if (get_option('brink_fp_weekly_digest_enabled', '1') !== '1') return;
+
+    global $wpdb;
+    $table = $wpdb->prefix . 'brink_stats';
+    $totals = $wpdb->get_results($wpdb->prepare(
+        "SELECT form_type, COUNT(*) as count FROM $table WHERE created_at >= DATE_SUB(NOW(), INTERVAL %d DAY) GROUP BY form_type",
+        7
+    ), ARRAY_A);
+
+    $counts = array('ad' => 0, 'ervaring' => 0, 'contact' => 0, 'inschrijving' => 0, 'reactie' => 0);
+    foreach ($totals as $row) { $counts[$row['form_type']] = (int) $row['count']; }
+    $grand_total = array_sum($counts);
+
+    if ($grand_total === 0 && apply_filters('brink_fp_skip_empty_digest', true)) return;
+
+    $labels = array('ad' => 'Advertenties', 'ervaring' => 'Ervaringen', 'contact' => 'Contactberichten', 'inschrijving' => 'Inschrijvingen', 'reactie' => 'Reacties');
+    $lines = array();
+    $lines[] = 'Wekelijks overzicht - Brink Multimedia Frontend Posting Pro';
+    $lines[] = '';
+    $lines[] = 'Periode: laatste 7 dagen';
+    $lines[] = 'Totaal aantal inzendingen: ' . $grand_total;
+    $lines[] = '';
+    foreach ($labels as $key => $label) {
+        $lines[] = '- ' . $label . ': ' . $counts[$key];
+    }
+    $lines[] = '';
+    $lines[] = 'Bekijk het volledige dashboard: ' . admin_url('admin.php?page=brink-posting');
+
+    $body = implode("\n", $lines);
+    $subject = 'Wekelijks overzicht: ' . $grand_total . ' nieuwe inzendingen';
+
+    wp_mail(get_option('admin_email'), $subject, $body, array('Content-Type: text/plain; charset=UTF-8'));
 }
 
 // Log functie voor statistieken
@@ -259,6 +314,9 @@ function brink_ad_settings_init() {
     register_setting('brink_ad_advanced_group', 'brink_ad_bump_limit');
     register_setting('brink_ad_advanced_group', 'brink_ad_banned_emails');
     register_setting('brink_ad_advanced_group', 'brink_ad_email_verification_enabled'); // V5.14.2 - E-mail verificatie (Optie 3)
+    register_setting('brink_ad_advanced_group', 'brink_ad_image_max_width'); // V5.17.0 - Max breedte bij compressie/resize
+    register_setting('brink_ad_advanced_group', 'brink_ad_gallery_max_images'); // V5.17.0 - Max aantal galerij-afbeeldingen
+    register_setting('brink_ad_advanced_group', 'brink_fp_weekly_digest_enabled'); // V5.17.0 - Wekelijkse digest-mail aan/uit
 
     // Openingstijden & Prijzen 
     register_setting('brink_ad_openingstijden_group', 'brink_openingstijden_data');
@@ -267,6 +325,9 @@ function brink_ad_settings_init() {
     if (!get_option('mystique_ad_bg_color')) update_option('mystique_ad_bg_color', '#ffffff');
     if (!get_option('mystique_ad_primary_color')) update_option('mystique_ad_primary_color', '#b5121b');
     if (!get_option('brink_ad_bump_limit')) update_option('brink_ad_bump_limit', '3');
+    if (!get_option('brink_ad_image_max_width')) update_option('brink_ad_image_max_width', '1600');
+    if (!get_option('brink_ad_gallery_max_images')) update_option('brink_ad_gallery_max_images', '5');
+    if (get_option('brink_fp_weekly_digest_enabled', false) === false) update_option('brink_fp_weekly_digest_enabled', '1');
     
     // E-mail Defaults
     if (!get_option('brink_ad_email_subject')) update_option('brink_ad_email_subject', 'Je advertentie #{advertentienummer} staat online!');
@@ -376,6 +437,12 @@ function brink_ad_handle_admin_actions() {
         if ($action === 'reset_stats') {
             global $wpdb;
             $wpdb->query("TRUNCATE TABLE " . $wpdb->prefix . "brink_stats");
+            wp_safe_redirect(admin_url('admin.php?page=brink-posting&tab=stats&msg=stats_reset'));
+            exit;
+        }
+
+        if ($action === 'reset_day_views') {
+            delete_option('brink_openingstijden_views');
             wp_safe_redirect(admin_url('admin.php?page=brink-posting&tab=stats&msg=stats_reset'));
             exit;
         }
@@ -510,6 +577,7 @@ function brink_ad_dashboard_page() {
             <a href="?page=brink-posting&tab=colors" class="nav-tab <?php echo $active_tab == 'colors' ? 'nav-tab-active' : ''; ?>">Instellingen & Formulier</a>
             <a href="?page=brink-posting&tab=email" class="nav-tab <?php echo $active_tab == 'email' ? 'nav-tab-active' : ''; ?>">E-mail Templates</a>
             <a href="?page=brink-posting&tab=advanced" class="nav-tab <?php echo $active_tab == 'advanced' ? 'nav-tab-active' : ''; ?>">Geavanceerd</a>
+            <a href="?page=brink-posting&tab=shortcodes" class="nav-tab <?php echo $active_tab == 'shortcodes' ? 'nav-tab-active' : ''; ?>">Shortcodes</a>
         </h2>
 
         <div style="background:#fff; padding:20px; border:1px solid #ccd0d4; box-shadow:0 1px 1px rgba(0,0,0,.04); margin-top:15px;">
@@ -522,6 +590,7 @@ function brink_ad_dashboard_page() {
             elseif ($active_tab == 'colors') brink_render_colors_tab();
             elseif ($active_tab == 'email') brink_render_email_tab();
             elseif ($active_tab == 'advanced') brink_render_advanced_tab();
+            elseif ($active_tab == 'shortcodes') brink_render_shortcodes_tab();
             ?>
         </div>
     </div>
@@ -702,6 +771,39 @@ function brink_render_stats_tab() {
     $brink_chart_inline_js = ob_get_clean();
     wp_add_inline_script('brink-chartjs', $brink_chart_inline_js, 'after');
     ?>
+
+    <?php
+    // FUNCTIONALITEIT (v5.17.0): welk dag/thema uit de Openingstijden & Prijzen-shortcode trekt
+    // de meeste interesse (scroll-into-view op de front-end, zie brink_frontend_openingstijden()).
+    $day_views = get_option('brink_openingstijden_views', array());
+    if (!is_array($day_views)) $day_views = array();
+    arsort($day_views);
+    $max_day_views = !empty($day_views) ? max($day_views) : 0;
+    ?>
+    <hr style="margin: 40px 0;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h2>Interesse per Dag/Thema (Openingstijden)</h2>
+        <?php if (!empty($day_views)): ?>
+            <a href="<?php echo esc_url(wp_nonce_url('?page=brink-posting&tab=stats&brink_action=reset_day_views', 'brink_admin_action')); ?>" class="button button-secondary" style="color:red; border-color:red;" onclick="return confirm('Zeker weten?');">Reset & Opruimen</a>
+        <?php endif; ?>
+    </div>
+    <p class="description">Gebaseerd op hoeveel unieke bezoekers per dag een specifiek dag/thema-blok daadwerkelijk in beeld hebben gekregen op de pagina met de <code>[openingstijden_prijzen]</code> shortcode.</p>
+    <?php if (empty($day_views)): ?>
+        <p>Nog geen data verzameld.</p>
+    <?php else: ?>
+        <div style="max-width:800px; margin-top:15px;">
+            <?php foreach ($day_views as $day_label => $count): $pct = $max_day_views > 0 ? round(($count / $max_day_views) * 100) : 0; ?>
+                <div style="margin-bottom:12px;">
+                    <div style="display:flex; justify-content:space-between; font-size:13px; margin-bottom:4px;">
+                        <strong><?php echo esc_html($day_label); ?></strong><span><?php echo (int) $count; ?> weergaven</span>
+                    </div>
+                    <div style="background:#f0f0f1; border-radius:4px; overflow:hidden; height:10px;">
+                        <div style="background:#b5121b; height:100%; width:<?php echo esc_attr($pct); ?>%;"></div>
+                    </div>
+                </div>
+            <?php endforeach; ?>
+        </div>
+    <?php endif; ?>
     <?php
 }
 
@@ -739,32 +841,117 @@ function brink_display_meta_row($label, $value) {
     echo '<tr><th style="width:200px; padding:10px 0; border-bottom:1px solid #eee;"><strong>' . esc_html($label) . '</strong></th><td style="padding:10px 0; border-bottom:1px solid #eee;">' . wp_kses_post($value) . '</td></tr>';
 }
 
+// FUNCTIONALITEIT (v5.17.0): serverside zoeken + paginering voor het dashboard, ter vervanging
+// van de oude aanpak (élke rij ongepagineerd laden en met JavaScript filteren) — dat schaalde
+// niet meer zodra er veel advertenties/inzendingen zijn. Deze posts_where-filter breidt een
+// WP_Query uit met een titel-OF-metaveld zoekopdracht, maar doet niets zolang de query var leeg is.
+add_filter('posts_where', 'brink_fp_dashboard_search_where', 10, 2);
+function brink_fp_dashboard_search_where($where, $query) {
+    $term = $query->get('brink_search_term');
+    if ($term === '' || $term === false) return $where;
+
+    global $wpdb;
+    $like = '%' . $wpdb->esc_like($term) . '%';
+    $conditions = array($wpdb->prepare("{$wpdb->posts}.post_title LIKE %s", $like));
+
+    $meta_keys = (array) $query->get('brink_search_meta_keys');
+    foreach ($meta_keys as $meta_key) {
+        $conditions[] = $wpdb->prepare(
+            "EXISTS (SELECT 1 FROM {$wpdb->postmeta} bpm WHERE bpm.post_id = {$wpdb->posts}.ID AND bpm.meta_key = %s AND bpm.meta_value LIKE %s)",
+            $meta_key, $like
+        );
+    }
+
+    $where .= ' AND (' . implode(' OR ', $conditions) . ')';
+    return $where;
+}
+
+// Bouwt een gepagineerde, doorzoekbare WP_Query voor één dashboard-sectie.
+function brink_fp_query_dashboard_section($args, $search_term, $meta_keys, $paged) {
+    $args['posts_per_page'] = 5;
+    $args['paged'] = max(1, (int) $paged);
+    $args['ignore_sticky_posts'] = true;
+    if ($search_term !== '') {
+        $args['brink_search_term'] = $search_term;
+        $args['brink_search_meta_keys'] = $meta_keys;
+    }
+    return new WP_Query($args);
+}
+
+// Print echte (server-rendered) paginatieknoppen voor één dashboard-sectie.
+function brink_fp_render_pagination($param_name, $current_page, $max_pages) {
+    if ($max_pages <= 1) return;
+    echo '<div class="brink-pagination">';
+    for ($i = 1; $i <= $max_pages; $i++) {
+        $url = add_query_arg($param_name, $i, brink_current_url());
+        $class = ($i === $current_page) ? 'active' : '';
+        echo '<a href="' . esc_url($url) . '" class="' . esc_attr($class) . '">' . (int) $i . '</a>';
+    }
+    echo '</div>';
+}
+
+// Print verborgen velden zodat het zoekformulier van één sectie de paginastatus/zoekterm van de
+// andere secties niet ongewild reset wanneer het wordt verzonden.
+function brink_fp_dashboard_preserve_fields($exclude_suffix) {
+    $keys = array('search_ads', 'paged_ads', 'search_erv', 'paged_erv', 'search_con', 'paged_con', 'search_ins', 'paged_ins');
+    foreach ($keys as $key) {
+        if (substr($key, -strlen($exclude_suffix)) === $exclude_suffix) continue;
+        if (isset($_GET[$key]) && $_GET[$key] !== '') {
+            echo '<input type="hidden" name="' . esc_attr($key) . '" value="' . esc_attr(sanitize_text_field(wp_unslash($_GET[$key]))) . '">';
+        }
+    }
+}
+
 function brink_render_dashboard_tab() {
     $ervaringen_cat = intval(get_option('brink_ad_ervaringen_category')); $contact_cat = intval(get_option('brink_ad_contact_category')); $inschrijving_cat = intval(get_option('brink_ad_inschrijving_category'));
     $speciale_cats = array_filter(array($ervaringen_cat, $contact_cat, $inschrijving_cat));
 
-    $args_ads = array('post_type' => 'post', 'posts_per_page' => -1, 'post_status' => 'publish', 'meta_query' => array(array('key' => 'expiration_date', 'compare' => 'EXISTS')));
-    if (!empty($speciale_cats)) $args_ads['category__not_in'] = $speciale_cats; $ads = get_posts($args_ads);
-    
-    $args_ervaringen = array('post_type' => 'post', 'posts_per_page' => -1, 'post_status' => array('publish', 'pending', 'draft'), 'meta_query' => array(array('key' => 'delete_token', 'compare' => 'EXISTS')));
+    // FUNCTIONALITEIT (v5.17.0): zoekterm + paginanummer per sectie uit de GET-parameters lezen.
+    $search_ads = isset($_GET['search_ads']) ? sanitize_text_field(wp_unslash($_GET['search_ads'])) : '';
+    $paged_ads  = isset($_GET['paged_ads']) ? max(1, intval($_GET['paged_ads'])) : 1;
+    $search_erv = isset($_GET['search_erv']) ? sanitize_text_field(wp_unslash($_GET['search_erv'])) : '';
+    $paged_erv  = isset($_GET['paged_erv']) ? max(1, intval($_GET['paged_erv'])) : 1;
+    $search_con = isset($_GET['search_con']) ? sanitize_text_field(wp_unslash($_GET['search_con'])) : '';
+    $paged_con  = isset($_GET['paged_con']) ? max(1, intval($_GET['paged_con'])) : 1;
+    $search_ins = isset($_GET['search_ins']) ? sanitize_text_field(wp_unslash($_GET['search_ins'])) : '';
+    $paged_ins  = isset($_GET['paged_ins']) ? max(1, intval($_GET['paged_ins'])) : 1;
+
+    $args_ads = array('post_type' => 'post', 'post_status' => 'publish', 'meta_query' => array(array('key' => 'expiration_date', 'compare' => 'EXISTS')));
+    if (!empty($speciale_cats)) $args_ads['category__not_in'] = $speciale_cats;
+    $query_ads = brink_fp_query_dashboard_section($args_ads, $search_ads, array('ad_email', 'ad_name'), $paged_ads);
+    $ads = $query_ads->posts;
+
+    $args_ervaringen = array('post_type' => 'post', 'post_status' => array('publish', 'pending', 'draft'), 'meta_query' => array(array('key' => 'delete_token', 'compare' => 'EXISTS')));
     if ($ervaringen_cat) { $args_ervaringen['category__in'] = array($ervaringen_cat); $args_ervaringen['meta_query'][] = array('key' => 'expiration_date', 'compare' => 'NOT EXISTS'); } else { $args_ervaringen['post__in'] = array(0); }
-    $ervaringen = get_posts($args_ervaringen);
+    $query_erv = brink_fp_query_dashboard_section($args_ervaringen, $search_erv, array('ad_email', 'ad_name'), $paged_erv);
+    $ervaringen = $query_erv->posts;
 
-    $args_contact = array('post_type' => 'post', 'posts_per_page' => -1, 'post_status' => array('publish', 'private'));
-    if ($contact_cat) { $args_contact['category__in'] = array($contact_cat); } else { $args_contact['post__in'] = array(0); } $contacten = get_posts($args_contact);
+    $args_contact = array('post_type' => 'post', 'post_status' => array('publish', 'private'));
+    if ($contact_cat) { $args_contact['category__in'] = array($contact_cat); } else { $args_contact['post__in'] = array(0); }
+    $query_con = brink_fp_query_dashboard_section($args_contact, $search_con, array('contact_name', 'contact_email'), $paged_con);
+    $contacten = $query_con->posts;
 
-    $args_inschrijving = array('post_type' => 'post', 'posts_per_page' => -1, 'post_status' => array('publish', 'private'));
-    if ($inschrijving_cat) { $args_inschrijving['category__in'] = array($inschrijving_cat); } else { $args_inschrijving['post__in'] = array(0); } $inschrijvingen = get_posts($args_inschrijving);
+    $args_inschrijving = array('post_type' => 'post', 'post_status' => array('publish', 'private'));
+    if ($inschrijving_cat) { $args_inschrijving['category__in'] = array($inschrijving_cat); } else { $args_inschrijving['post__in'] = array(0); }
+    $query_ins = brink_fp_query_dashboard_section($args_inschrijving, $search_ins, array('inschrijving_heer', 'inschrijving_dame', 'inschrijving_email'), $paged_ins);
+    $inschrijvingen = $query_ins->posts;
 
     $placeholder_id = get_option('brink_ad_placeholder_image');
     ?>
-    <style>.brink-search-bar { width: 100%; max-width: 300px; padding: 5px 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; } .brink-pagination { margin-top: 10px; display: flex; gap: 5px; justify-content: flex-end; } .brink-pagination button { padding: 4px 10px; cursor: pointer; border: 1px solid #ddd; background: #f9f9f9; border-radius: 3px; } .brink-pagination button.active { background: #b5121b; color: #fff; border-color: #b5121b; }</style>
+    <style>.brink-search-bar { width: 100%; max-width: 300px; padding: 5px 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; } .brink-pagination { margin-top: 10px; display: flex; gap: 5px; justify-content: flex-end; } .brink-pagination a { padding: 4px 10px; cursor: pointer; border: 1px solid #ddd; background: #f9f9f9; border-radius: 3px; text-decoration: none; color: #2c3338; } .brink-pagination a.active { background: #b5121b; color: #fff; border-color: #b5121b; }</style>
 
-    <h2>1. Actieve Advertenties</h2><input type="text" id="search-ads" class="brink-search-bar" placeholder="Zoek in advertenties...">
+    <h2>1. Actieve Advertenties</h2>
+    <form method="get">
+        <input type="hidden" name="page" value="brink-posting"><input type="hidden" name="tab" value="dashboard">
+        <?php brink_fp_dashboard_preserve_fields('_ads'); ?>
+        <input type="text" name="search_ads" class="brink-search-bar" placeholder="Zoek in advertenties (titel, naam, e-mail)..." value="<?php echo esc_attr($search_ads); ?>">
+        <button type="submit" class="button">Zoeken</button>
+        <?php if ($search_ads !== ''): ?><a href="<?php echo esc_url(remove_query_arg(array('search_ads', 'paged_ads'))); ?>" class="button">Wissen</a><?php endif; ?>
+    </form>
     <table class="wp-list-table widefat fixed striped" id="table-ads">
         <thead><tr><th style="width:60px;">Foto</th><th>Titel</th><th>ID</th><th>Weergaven</th><th>Adverteerder</th><th>Verloopt op</th><th>Acties</th></tr></thead>
         <tbody>
-            <?php if (empty($ads)): ?><tr class="no-results"><td colspan="7">Geen actieve advertenties gevonden.</td></tr>
+            <?php if (empty($ads)): ?><tr><td colspan="7"><?php echo $search_ads !== '' ? 'Geen resultaten voor "' . esc_html($search_ads) . '".' : 'Geen actieve advertenties gevonden.'; ?></td></tr>
             <?php else: foreach($ads as $ad): 
                     $email = get_post_meta($ad->ID, 'ad_email', true); $name = get_post_meta($ad->ID, 'ad_name', true);
                     $views = get_post_meta($ad->ID, 'ad_views', true) ?: 0; $exp = get_post_meta($ad->ID, 'expiration_date', true);
@@ -786,13 +973,22 @@ function brink_render_dashboard_tab() {
                 </tr>
             <?php endforeach; endif; ?>
         </tbody>
-    </table><div id="page-ads" class="brink-pagination"></div><hr style="margin: 40px 0;">
+    </table>
+    <?php brink_fp_render_pagination('paged_ads', $paged_ads, $query_ads->max_num_pages); ?>
+    <hr style="margin: 40px 0;">
 
-    <h2>2. Ingestuurde Ervaringen</h2><input type="text" id="search-erv" class="brink-search-bar" placeholder="Zoek in ervaringen...">
+    <h2>2. Ingestuurde Ervaringen</h2>
+    <form method="get">
+        <input type="hidden" name="page" value="brink-posting"><input type="hidden" name="tab" value="dashboard">
+        <?php brink_fp_dashboard_preserve_fields('_erv'); ?>
+        <input type="text" name="search_erv" class="brink-search-bar" placeholder="Zoek in ervaringen (titel, naam, e-mail)..." value="<?php echo esc_attr($search_erv); ?>">
+        <button type="submit" class="button">Zoeken</button>
+        <?php if ($search_erv !== ''): ?><a href="<?php echo esc_url(remove_query_arg(array('search_erv', 'paged_erv'))); ?>" class="button">Wissen</a><?php endif; ?>
+    </form>
     <table class="wp-list-table widefat fixed striped" id="table-erv">
         <thead><tr><th>Titel</th><th>Status</th><th>ID</th><th>Schrijver</th><th>Acties</th></tr></thead>
         <tbody>
-            <?php if (empty($ervaringen)): ?><tr class="no-results"><td colspan="5">Geen ervaringen gevonden.</td></tr>
+            <?php if (empty($ervaringen)): ?><tr><td colspan="5"><?php echo $search_erv !== '' ? 'Geen resultaten voor "' . esc_html($search_erv) . '".' : 'Geen ervaringen gevonden.'; ?></td></tr>
             <?php else: foreach($ervaringen as $erv): 
                     $email = get_post_meta($erv->ID, 'ad_email', true); $name = get_post_meta($erv->ID, 'ad_name', true);
                     $status_label = ($erv->post_status === 'pending') ? '<span style="color:orange; font-weight:bold;">Wacht op keuring</span>' : '<span style="color:green; font-weight:bold;">Live</span>';
@@ -811,7 +1007,9 @@ function brink_render_dashboard_tab() {
                 </tr>
             <?php endforeach; endif; ?>
         </tbody>
-    </table><div id="page-erv" class="brink-pagination"></div><hr style="margin: 40px 0;">
+    </table>
+    <?php brink_fp_render_pagination('paged_erv', $paged_erv, $query_erv->max_num_pages); ?>
+    <hr style="margin: 40px 0;">
 
     <div style="display:flex; justify-content:space-between; align-items:center;">
         <h2>3. Contactformulier Inzendingen</h2>
@@ -819,11 +1017,17 @@ function brink_render_dashboard_tab() {
             <a href="<?php echo esc_url(wp_nonce_url('?page=brink-posting&tab=dashboard&brink_action=delete_all_contacts', 'brink_admin_action')); ?>" class="button" style="color:red; border-color:red;" onclick="return confirm('Weet je het absoluut zeker? ALLE contactinzendingen worden nu definitief verwijderd.');">Alles Verwijderen</a>
         <?php endif; ?>
     </div>
-    <input type="text" id="search-con" class="brink-search-bar" placeholder="Zoek in contactinzendingen...">
+    <form method="get">
+        <input type="hidden" name="page" value="brink-posting"><input type="hidden" name="tab" value="dashboard">
+        <?php brink_fp_dashboard_preserve_fields('_con'); ?>
+        <input type="text" name="search_con" class="brink-search-bar" placeholder="Zoek in contactinzendingen (onderwerp, naam, e-mail)..." value="<?php echo esc_attr($search_con); ?>">
+        <button type="submit" class="button">Zoeken</button>
+        <?php if ($search_con !== ''): ?><a href="<?php echo esc_url(remove_query_arg(array('search_con', 'paged_con'))); ?>" class="button">Wissen</a><?php endif; ?>
+    </form>
     <table class="wp-list-table widefat fixed striped" id="table-con">
         <thead><tr><th>Onderwerp</th><th>Naam</th><th>E-mailadres</th><th>Datum</th><th>Acties</th></tr></thead>
         <tbody>
-            <?php if (empty($contacten)): ?><tr class="no-results"><td colspan="5">Geen inzendingen gevonden.</td></tr>
+            <?php if (empty($contacten)): ?><tr><td colspan="5"><?php echo $search_con !== '' ? 'Geen resultaten voor "' . esc_html($search_con) . '".' : 'Geen inzendingen gevonden.'; ?></td></tr>
             <?php else: foreach($contacten as $con): 
                     $name = get_post_meta($con->ID, 'contact_name', true); $email = get_post_meta($con->ID, 'contact_email', true);
                 ?>
@@ -837,7 +1041,9 @@ function brink_render_dashboard_tab() {
                 </tr>
             <?php endforeach; endif; ?>
         </tbody>
-    </table><div id="page-con" class="brink-pagination"></div><hr style="margin: 40px 0;">
+    </table>
+    <?php brink_fp_render_pagination('paged_con', $paged_con, $query_con->max_num_pages); ?>
+    <hr style="margin: 40px 0;">
 
     <div style="display:flex; justify-content:space-between; align-items:center;">
         <h2>4. Inschrijfformulieren</h2>
@@ -845,11 +1051,17 @@ function brink_render_dashboard_tab() {
             <a href="<?php echo esc_url(wp_nonce_url('?page=brink-posting&tab=dashboard&brink_action=delete_all_inschrijvingen', 'brink_admin_action')); ?>" class="button" style="color:red; border-color:red;" onclick="return confirm('Weet je het absoluut zeker? ALLE inschrijvingen worden nu definitief verwijderd.');">Alles Verwijderen</a>
         <?php endif; ?>
     </div>
-    <input type="text" id="search-ins" class="brink-search-bar" placeholder="Zoek in inschrijvingen...">
+    <form method="get">
+        <input type="hidden" name="page" value="brink-posting"><input type="hidden" name="tab" value="dashboard">
+        <?php brink_fp_dashboard_preserve_fields('_ins'); ?>
+        <input type="text" name="search_ins" class="brink-search-bar" placeholder="Zoek in inschrijvingen (naam, e-mail)..." value="<?php echo esc_attr($search_ins); ?>">
+        <button type="submit" class="button">Zoeken</button>
+        <?php if ($search_ins !== ''): ?><a href="<?php echo esc_url(remove_query_arg(array('search_ins', 'paged_ins'))); ?>" class="button">Wissen</a><?php endif; ?>
+    </form>
     <table class="wp-list-table widefat fixed striped" id="table-ins">
         <thead><tr><th>Koppel / Persoon</th><th>E-mailadres</th><th>Woonplaats</th><th>Inschrijfdatum</th><th>Acties</th></tr></thead>
         <tbody>
-            <?php if (empty($inschrijvingen)): ?><tr class="no-results"><td colspan="5">Geen inschrijvingen gevonden.</td></tr>
+            <?php if (empty($inschrijvingen)): ?><tr><td colspan="5"><?php echo $search_ins !== '' ? 'Geen resultaten voor "' . esc_html($search_ins) . '".' : 'Geen inschrijvingen gevonden.'; ?></td></tr>
             <?php else: foreach($inschrijvingen as $ins): 
                     $heer = get_post_meta($ins->ID, 'inschrijving_heer', true); $dame = get_post_meta($ins->ID, 'inschrijving_dame', true);
                     $email = get_post_meta($ins->ID, 'inschrijving_email', true); $stad = get_post_meta($ins->ID, 'inschrijving_postcode', true);
@@ -865,7 +1077,8 @@ function brink_render_dashboard_tab() {
                 </tr>
             <?php endforeach; endif; ?>
         </tbody>
-    </table><div id="page-ins" class="brink-pagination"></div>
+    </table>
+    <?php brink_fp_render_pagination('paged_ins', $paged_ins, $query_ins->max_num_pages); ?>
 
     <!-- Modals voor Verwijderen met reden & Ban -->
     <div id="brink-action-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:99999;">
@@ -923,46 +1136,6 @@ function brink_render_dashboard_tab() {
         
         window.location.href = '?page=brink-posting&tab=dashboard&brink_action=' + action + '&ad_id=' + id + '&reason=' + encodeURIComponent(reason) + '&_wpnonce=' + encodeURIComponent(brinkAdminNonce);
     }
-    
-    document.addEventListener('DOMContentLoaded', function() {
-        function initTable(tableId, searchInputId, paginationContainerId) {
-            const table = document.getElementById(tableId); if(!table) return;
-            const searchInput = document.getElementById(searchInputId); const paginationContainer = document.getElementById(paginationContainerId);
-            const tbody = table.querySelector('tbody'); let allRows = Array.from(tbody.querySelectorAll('tr.item-row'));
-            if(allRows.length === 0) return;
-            const rowsPerPage = 5; let currentPage = 1; let filteredRows = allRows;
-            function render() {
-                allRows.forEach(r => r.style.display = 'none');
-                const start = (currentPage - 1) * rowsPerPage; const end = start + rowsPerPage;
-                filteredRows.slice(start, end).forEach(r => r.style.display = '');
-                renderPagination();
-            }
-            function renderPagination() {
-                const totalPages = Math.ceil(filteredRows.length / rowsPerPage) || 1;
-                paginationContainer.innerHTML = ''; if(totalPages <= 1) return;
-                for(let i = 1; i <= totalPages; i++) {
-                    const btn = document.createElement('button'); btn.innerText = i;
-                    if(i === currentPage) btn.className = 'active';
-                    btn.onclick = (e) => { e.preventDefault(); currentPage = i; render(); };
-                    paginationContainer.appendChild(btn);
-                }
-            }
-            if(searchInput) {
-                searchInput.addEventListener('input', function(e) {
-                    const query = e.target.value.toLowerCase();
-                    filteredRows = allRows.filter(row => row.innerText.toLowerCase().includes(query)); currentPage = 1;
-                    let noRes = tbody.querySelector('.no-results');
-                    if(filteredRows.length === 0) {
-                        if(!noRes) { noRes = document.createElement('tr'); noRes.className = 'no-results'; noRes.innerHTML = `<td colspan="7">Geen resultaten voor "${e.target.value}"</td>`; tbody.appendChild(noRes); } else { noRes.style.display = ''; }
-                    } else if(noRes) { noRes.style.display = 'none'; }
-                    render();
-                });
-            }
-            render();
-        }
-        initTable('table-ads', 'search-ads', 'page-ads'); initTable('table-erv', 'search-erv', 'page-erv');
-        initTable('table-con', 'search-con', 'page-con'); initTable('table-ins', 'search-ins', 'page-ins');
-    });
     </script>
     <?php
 }
@@ -1091,6 +1264,23 @@ function brink_render_advanced_tab() {
             <tr valign="top"><th scope="row">Bumpen toestaan?</th><td><select name="brink_ad_bump_enabled"><option value="1" <?php selected(get_option('brink_ad_bump_enabled'), '1'); ?>>Ja</option><option value="0" <?php selected(get_option('brink_ad_bump_enabled'), '0'); ?>>Nee</option></select></td></tr>
             <tr valign="top"><th scope="row">Max bumps</th><td><input type="number" name="brink_ad_bump_limit" value="<?php echo esc_attr(get_option('brink_ad_bump_limit', '3')); ?>" style="width:80px;" /></td></tr>
         </table><hr>
+        <h3>Wekelijkse Digest-mail</h3>
+        <table class="form-table">
+            <tr valign="top"><th scope="row">Wekelijks overzicht per e-mail?</th><td>
+                <select name="brink_fp_weekly_digest_enabled">
+                    <option value="1" <?php selected(get_option('brink_fp_weekly_digest_enabled', '1'), '1'); ?>>AAN: stuur elke week een overzichtsmail naar de beheerder</option>
+                    <option value="0" <?php selected(get_option('brink_fp_weekly_digest_enabled', '1'), '0'); ?>>UIT: geen wekelijkse mail</option>
+                </select>
+                <p class="description">Gaat naar het WordPress-beheerder e-mailadres (<?php echo esc_html(get_option('admin_email')); ?>) en bevat het aantal advertenties, ervaringen, contactberichten, inschrijvingen en reacties van de afgelopen 7 dagen.</p>
+            </td></tr>
+        </table><hr>
+        <h3>Afbeeldingen (Compressie & Galerij)</h3>
+        <table class="form-table">
+            <tr valign="top"><th scope="row">Max. breedte na compressie (px)</th><td><input type="number" name="brink_ad_image_max_width" value="<?php echo esc_attr(get_option('brink_ad_image_max_width', '1600')); ?>" style="width:100px;" min="0" />
+            <p class="description">Geüploade afbeeldingen breder dan dit aantal pixels worden automatisch verkleind vóór de WebP-conversie (beeldverhouding blijft behouden). Zet op 0 om resizen uit te schakelen.</p></td></tr>
+            <tr valign="top"><th scope="row">Max. aantal galerij-afbeeldingen</th><td><input type="number" name="brink_ad_gallery_max_images" value="<?php echo esc_attr(get_option('brink_ad_gallery_max_images', '5')); ?>" style="width:100px;" min="0" max="20" />
+            <p class="description">Maximum aantal extra foto's dat een adverteerder naast de hoofdfoto kan uploaden (zie het advertentieformulier).</p></td></tr>
+        </table><hr>
         <h3>Placeholder Afbeelding (Voor Advertenties & Ervaringen)</h3>
         <table class="form-table">
             <tr valign="top">
@@ -1123,6 +1313,96 @@ function brink_render_advanced_tab() {
             }); mediaUploader.open();
         });
         $('#remove-placeholder-btn').click(function(e) { e.preventDefault(); $('#brink_ad_placeholder_image').val(''); $('#placeholder-preview').attr('src', '').hide(); $(this).hide(); });
+    });
+    </script>
+    <?php
+}
+
+// Overzicht van alle shortcodes die deze plugin registreert. Data-driven opgezet: bij een
+// nieuwe add_shortcode() hoger in dit bestand hoeft alleen deze array aangevuld te worden
+// om hem automatisch in dit tabblad te tonen — voorkomt dat dit overzicht ooit achterloopt.
+function brink_render_shortcodes_tab() {
+    $shortcodes = array(
+        array(
+            'tag'          => 'mystique_advertentie_formulier',
+            'title'        => 'Advertentie plaatsen',
+            'description'  => 'Front-end formulier waarmee bezoekers een advertentie kunnen plaatsen (en, via de edit-link in de bevestigingsmail, later bewerken).',
+            'settings_tab' => 'colors',
+        ),
+        array(
+            'tag'          => 'mystique_ervaringen_formulier',
+            'title'        => 'Ervaring insturen',
+            'description'  => 'Front-end formulier waarmee bezoekers een ervaring/verhaal kunnen insturen. Komt eerst in de keuringswachtrij (status "pending") terecht.',
+            'settings_tab' => 'colors',
+        ),
+        array(
+            'tag'          => 'mystique_contactformulier',
+            'title'        => 'Contactformulier',
+            'description'  => 'Algemeen contactformulier. Inzendingen komen terecht bij de ingestelde categorie en worden gemaild naar de ingestelde ontvanger(s).',
+            'settings_tab' => 'colors',
+        ),
+        array(
+            'tag'          => 'mystique_inschrijfformulier',
+            'title'        => 'Inschrijfformulier',
+            'description'  => 'Inschrijfformulier (heer/dame, contactgegevens, geboortedatum). Inzendingen komen terecht bij de ingestelde categorie en ontvanger(s).',
+            'settings_tab' => 'colors',
+        ),
+        array(
+            'tag'          => 'openingstijden_prijzen',
+            'title'        => 'Openingstijden & Prijzen',
+            'description'  => 'Toont de openingstijden- en prijzentabel zoals ingesteld op het tabblad "Openingstijden & Prijzen".',
+            'settings_tab' => 'openingstijden',
+        ),
+    );
+    ?>
+    <h3>Beschikbare Shortcodes</h3>
+    <p class="description">Plaats één van onderstaande shortcodes in een pagina, bericht of widget om het bijbehorende onderdeel te tonen.</p>
+    <style>
+        .brink-sc-table { width:100%; border-collapse: collapse; margin-top:15px; }
+        .brink-sc-table th, .brink-sc-table td { text-align:left; padding:12px 10px; border-bottom:1px solid #eee; vertical-align:top; }
+        .brink-sc-code-wrap { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+        .brink-sc-code { background:#f0f0f1; padding:6px 10px; border-radius:4px; font-family:monospace; white-space:nowrap; }
+        .brink-sc-copy-btn.copied { color:#00a32a; border-color:#00a32a; }
+    </style>
+    <table class="brink-sc-table">
+        <thead><tr><th style="width:300px;">Shortcode</th><th>Waarvoor</th><th style="width:150px;">Instellingen</th></tr></thead>
+        <tbody>
+        <?php foreach ($shortcodes as $sc): $dom_id = 'sc-' . sanitize_html_class($sc['tag']); ?>
+            <tr>
+                <td>
+                    <div class="brink-sc-code-wrap">
+                        <code class="brink-sc-code" id="<?php echo esc_attr($dom_id); ?>">[<?php echo esc_html($sc['tag']); ?>]</code>
+                        <button type="button" class="button button-small brink-sc-copy-btn" data-target="<?php echo esc_attr($dom_id); ?>">Kopieer</button>
+                    </div>
+                </td>
+                <td><strong><?php echo esc_html($sc['title']); ?></strong><br><span style="color:#666;"><?php echo esc_html($sc['description']); ?></span></td>
+                <td><a href="?page=brink-posting&tab=<?php echo esc_attr($sc['settings_tab']); ?>" class="button button-small">Naar instellingen</a></td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+        document.querySelectorAll('.brink-sc-copy-btn').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                var codeEl = document.getElementById(btn.getAttribute('data-target'));
+                var text = codeEl.textContent;
+                var restore = function () {
+                    var original = 'Kopieer';
+                    btn.textContent = 'Gekopieerd!';
+                    btn.classList.add('copied');
+                    setTimeout(function () { btn.textContent = original; btn.classList.remove('copied'); }, 1500);
+                };
+                if (navigator.clipboard && window.isSecureContext) {
+                    navigator.clipboard.writeText(text).then(restore);
+                } else {
+                    var tmp = document.createElement('textarea');
+                    tmp.value = text; document.body.appendChild(tmp); tmp.select();
+                    document.execCommand('copy'); document.body.removeChild(tmp);
+                    restore();
+                }
+            });
+        });
     });
     </script>
     <?php
@@ -1252,6 +1532,42 @@ function brink_handle_frontend_actions() {
 // ==========================================
 // 5. WEERGAVEN TRACKER & ELEMENTOR CLEANUP
 // ==========================================
+// FUNCTIONALITEIT (v5.17.0): automatische SEO meta description + Open Graph/Twitter-tags voor
+// advertentie- en ervaringsposts, zodat deze er ook zonder los SEO-plugin netjes uitzien bij het
+// delen op social media en in zoekresultaten. Slaat over als er al een bekend SEO-plugin actief
+// is, om dubbele/conflicterende meta-tags te voorkomen.
+add_action('wp_head', 'brink_fp_output_seo_meta_tags', 1);
+function brink_fp_output_seo_meta_tags() {
+    if (!is_single()) return;
+    if (defined('WPSEO_VERSION') || class_exists('RankMath') || defined('AIOSEO_VERSION')) return;
+
+    global $post;
+    if (!$post || !get_post_meta($post->ID, 'delete_token', true)) return;
+
+    $description = wp_strip_all_tags($post->post_content);
+    $description = wp_trim_words($description, 30, '...');
+
+    $title = get_the_title($post);
+    $url = get_permalink($post);
+    $image_id = get_post_thumbnail_id($post->ID);
+    $image_url = $image_id ? wp_get_attachment_image_url($image_id, 'large') : '';
+
+    echo "\n<!-- Brink Multimedia Frontend Posting Pro: SEO meta -->\n";
+    if ($description) {
+        echo '<meta name="description" content="' . esc_attr($description) . '">' . "\n";
+    }
+    echo '<meta property="og:type" content="article">' . "\n";
+    echo '<meta property="og:title" content="' . esc_attr($title) . '">' . "\n";
+    if ($description) {
+        echo '<meta property="og:description" content="' . esc_attr($description) . '">' . "\n";
+    }
+    echo '<meta property="og:url" content="' . esc_url($url) . '">' . "\n";
+    if ($image_url) {
+        echo '<meta property="og:image" content="' . esc_url($image_url) . '">' . "\n";
+    }
+    echo '<meta name="twitter:card" content="' . ($image_url ? 'summary_large_image' : 'summary') . '">' . "\n";
+}
+
 add_action('wp_head', 'brink_track_ad_views');
 function brink_track_ad_views() {
     if (!is_single()) return;
@@ -1269,6 +1585,18 @@ function brink_track_ad_views() {
 
     $views = (int) get_post_meta($post->ID, 'ad_views', true);
     update_post_meta($post->ID, 'ad_views', $views + 1);
+}
+
+// FUNCTIONALITEIT (v5.17.0): ruimt galerij-afbeeldingen op zodra de bijbehorende post ergens
+// verwijderd wordt (admin-verwijdering, ban, front-end delete-link, of de expiratie-cron) —
+// één centrale hook i.p.v. dit bij elke afzonderlijke wp_delete_post()-aanroep te herhalen.
+add_action('before_delete_post', 'brink_fp_cleanup_gallery_on_delete');
+function brink_fp_cleanup_gallery_on_delete($post_id) {
+    $gallery_raw = get_post_meta($post_id, 'ad_gallery_ids', true);
+    if (empty($gallery_raw)) return;
+    foreach (array_filter(array_map('intval', explode(',', (string) $gallery_raw))) as $gallery_id) {
+        wp_delete_attachment($gallery_id, true);
+    }
 }
 
 add_action('before_delete_post', 'brink_elementor_submission_cleanup');
@@ -1319,6 +1647,18 @@ function brink_force_webp_conversion_and_seo($attachment_id, $ad_title) {
 
     $editor = wp_get_image_editor($new_path);
     if (!is_wp_error($editor)) {
+        // FUNCTIONALITEIT (v5.17.0): automatische compressie/resize naast de WebP-conversie.
+        // Voorkomt dat bezoekers onnodig grote originele foto's (die de 1MB-uploadcheck net
+        // doorstaan, bijv. een kleine bestandsgrootte met hele hoge resolutie) op de site zetten.
+        $max_width = (int) get_option('brink_ad_image_max_width', 1600);
+        if ($max_width > 0) {
+            $size = $editor->get_size();
+            if (!empty($size['width']) && $size['width'] > $max_width) {
+                $editor->resize($max_width, null, false);
+            }
+        }
+        $editor->set_quality((int) apply_filters('brink_fp_image_quality', 82));
+
         $webp_file = preg_replace('/\.(jpg|jpeg|png)$/i', '.webp', $new_path); 
         $editor->save($webp_file, 'image/webp');
         update_attached_file($attachment_id, $webp_file); 
@@ -1330,6 +1670,76 @@ function brink_force_webp_conversion_and_seo($attachment_id, $ad_title) {
 }
 
 // Helper: Kopieer originele placeholder, maak hem uniek, converteer & assign
+// FUNCTIONALITEIT (v5.17.0): verwerkt meerdere galerij-afbeeldingen naast de hoofdfoto van een
+// advertentie. Ongeldige bestanden (te groot, verkeerd type) worden individueel overgeslagen
+// i.p.v. de hele inzending te blokkeren — de hoofdfoto blijft leidend voor validatiefouten.
+function brink_fp_handle_ad_gallery_upload($post_id, $seo_base_name) {
+    if (empty($_FILES['ad_gallery_images']['name']) || !is_array($_FILES['ad_gallery_images']['name'])) return array();
+
+    require_once(ABSPATH . 'wp-admin/includes/image.php');
+    require_once(ABSPATH . 'wp-admin/includes/file.php');
+    require_once(ABSPATH . 'wp-admin/includes/media.php');
+
+    $max_images = (int) get_option('brink_ad_gallery_max_images', 5);
+    $allowed_mimes = array('image/jpeg', 'image/png');
+    $files = $_FILES['ad_gallery_images'];
+    $uploaded_ids = array();
+    $count = 0;
+
+    foreach ($files['name'] as $idx => $name) {
+        if ($count >= $max_images) break;
+        if (empty($name)) continue;
+        if (!empty($files['error'][$idx]) && $files['error'][$idx] !== UPLOAD_ERR_OK) continue;
+        if ($files['size'][$idx] > 1 * 1024 * 1024) continue;
+
+        $filetype = wp_check_filetype_and_ext($files['tmp_name'][$idx], $name);
+        if (empty($filetype['type']) || !in_array($filetype['type'], $allowed_mimes, true)) continue;
+
+        $_FILES['brink_gallery_tmp_field'] = array(
+            'name'     => $files['name'][$idx],
+            'type'     => $files['type'][$idx],
+            'tmp_name' => $files['tmp_name'][$idx],
+            'error'    => $files['error'][$idx],
+            'size'     => $files['size'][$idx],
+        );
+        $attachment_id = media_handle_upload('brink_gallery_tmp_field', $post_id);
+        unset($_FILES['brink_gallery_tmp_field']);
+
+        if (!is_wp_error($attachment_id)) {
+            brink_force_webp_conversion_and_seo($attachment_id, $seo_base_name . ' ' . ($count + 1));
+            $uploaded_ids[] = $attachment_id;
+            $count++;
+        }
+    }
+
+    return $uploaded_ids;
+}
+
+// Toont de galerij-afbeeldingen (indien aanwezig) onderaan de post-inhoud, zodat er geen
+// aanpassing aan het thema nodig is om ze zichtbaar te maken.
+add_filter('the_content', 'brink_fp_append_gallery_to_content');
+function brink_fp_append_gallery_to_content($content) {
+    if (is_admin() || !in_the_loop() || !is_main_query() || !is_singular('post')) return $content;
+
+    global $post;
+    $gallery_ids_raw = get_post_meta($post->ID, 'ad_gallery_ids', true);
+    if (empty($gallery_ids_raw)) return $content;
+
+    $ids = array_filter(array_map('intval', explode(',', $gallery_ids_raw)));
+    if (empty($ids)) return $content;
+
+    $html = '<div class="brink-ad-gallery">';
+    foreach ($ids as $id) {
+        $full_url = wp_get_attachment_image_url($id, 'full');
+        if (!$full_url) continue;
+        $html .= '<a href="' . esc_url($full_url) . '" class="brink-ad-gallery-item" target="_blank" rel="noopener noreferrer">' . wp_get_attachment_image($id, 'medium') . '</a>';
+    }
+    $html .= '</div>';
+    $html .= '<style>.brink-ad-gallery{display:flex;flex-wrap:wrap;gap:10px;margin-top:20px;}.brink-ad-gallery-item img{width:150px;height:150px;object-fit:cover;border-radius:8px;display:block;}</style>';
+
+    return $content . $html;
+}
+
 function brink_assign_placeholder_copy($post_id, $ad_title) {
     $placeholder_id = (int) get_option('brink_ad_placeholder_image');
     if (!$placeholder_id) return;
@@ -1511,6 +1921,20 @@ function brink_frontend_ad_form() {
                     brink_assign_placeholder_copy($post_id, $seo_img_name);
                 }
 
+                // FUNCTIONALITEIT (v5.17.0): galerij-afbeeldingen naast de hoofdfoto verwerken.
+                // Bij een bewerking vervangt een nieuwe galerij-upload de oude (die wordt eerst
+                // opgeruimd, consistent met hoe de hoofdfoto bij een update wordt vervangen).
+                $new_gallery_ids = brink_fp_handle_ad_gallery_upload($post_id, $seo_img_name);
+                if (!empty($new_gallery_ids)) {
+                    if ($is_update) {
+                        $old_gallery_raw = get_post_meta($post_id, 'ad_gallery_ids', true);
+                        foreach (array_filter(array_map('intval', explode(',', (string) $old_gallery_raw))) as $old_gallery_id) {
+                            wp_delete_attachment($old_gallery_id, true);
+                        }
+                    }
+                    update_post_meta($post_id, 'ad_gallery_ids', implode(',', $new_gallery_ids));
+                }
+
                 if (!$is_update) {
                     if ($verify_enabled) {
                         brink_send_verify_email($post_id);
@@ -1551,6 +1975,10 @@ function brink_frontend_ad_form() {
         <p><label>Foto (Optioneel, Max 1MB)</label><input type="file" name="ad_image" id="ad_image" accept="image/jpeg,image/png">
             <div id="image-preview-container" style="display:none; margin-top:10px;"><img id="image-preview" src="#" style="max-width:150px; border-radius:5px;"><div class="progress-wrapper"><div id="upload-bar"></div></div></div>
         </p>
+        <p><label>Extra foto's / Galerij (Optioneel, max <?php echo (int) get_option('brink_ad_gallery_max_images', 5); ?> stuks, elk max 1MB)</label>
+            <input type="file" name="ad_gallery_images[]" id="ad_gallery_images" accept="image/jpeg,image/png" multiple>
+            <div id="gallery-preview-container" style="display:none; margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;"></div>
+        </p>
         
         <div class="form-row">
             <p><label>Naam</label><input type="text" name="ad_name" value="<?php echo esc_attr($val_name); ?>"></p>
@@ -1577,6 +2005,22 @@ function brink_frontend_ad_form() {
                 if (file.size > 1024 * 1024) { alert('Bestand is groter dan 1MB.'); this.value = ''; return; }
                 document.getElementById('image-preview-container').style.display = 'block'; document.getElementById('image-preview').src = URL.createObjectURL(file); document.getElementById('upload-bar').style.width = '100%';
             }
+        };
+    }
+    if(document.getElementById('ad_gallery_images')) {
+        document.getElementById('ad_gallery_images').onchange = function(evt) {
+            const maxImages = <?php echo (int) get_option('brink_ad_gallery_max_images', 5); ?>;
+            const container = document.getElementById('gallery-preview-container');
+            container.innerHTML = ''; container.style.display = 'none';
+            let files = Array.from(this.files);
+            if (files.length > maxImages) { alert('Je kunt maximaal ' + maxImages + ' extra foto\'s uploaden.'); this.value = ''; return; }
+            for (const file of files) {
+                if (file.size > 1024 * 1024) { alert('"' + file.name + '" is groter dan 1MB.'); this.value = ''; container.style.display = 'none'; return; }
+                const img = document.createElement('img');
+                img.src = URL.createObjectURL(file); img.style.cssText = 'width:80px; height:80px; object-fit:cover; border-radius:5px;';
+                container.appendChild(img);
+            }
+            if (files.length) container.style.display = 'flex';
         };
     }
     
@@ -1914,7 +2358,7 @@ function brink_frontend_openingstijden() {
     
     <div class="brink-ot-container">
         <?php foreach ($items as $item): ?>
-            <div class="brink-ot-block">
+            <div class="brink-ot-block" data-brink-day="<?php echo esc_attr($item['day']); ?>">
                 <div class="brink-ot-header"><?php echo esc_html($item['day']); ?> VAN <?php echo esc_html($item['time']); ?></div>
                 <?php if(!empty($item['prices'])) { 
                     foreach($item['prices'] as $price): ?>
@@ -1926,10 +2370,67 @@ function brink_frontend_openingstijden() {
             </div>
         <?php endforeach; ?>
     </div>
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+        // FUNCTIONALITEIT (v5.17.0): meet per dag/thema hoeveel bezoekers dat blok daadwerkelijk
+        // te zien krijgen (scroll-into-view), zodat de beheerder kan zien welk dag/thema de
+        // meeste interesse trekt. Eén melding per dag/thema per bezoeker per dag (dedupe serverside).
+        if (!('IntersectionObserver' in window)) return;
+        var seen = new Set();
+        var nonce = <?php echo wp_json_encode(wp_create_nonce('brink_fp_ot_track')); ?>;
+        var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
+        var observer = new IntersectionObserver(function (entries) {
+            entries.forEach(function (entry) {
+                if (!entry.isIntersecting) return;
+                var day = entry.target.getAttribute('data-brink-day');
+                if (!day || seen.has(day)) return;
+                seen.add(day);
+                observer.unobserve(entry.target);
+                var formData = new FormData();
+                formData.append('action', 'brink_fp_track_day_view');
+                formData.append('nonce', nonce);
+                formData.append('day', day);
+                fetch(ajaxUrl, { method: 'POST', body: formData, credentials: 'same-origin' });
+            });
+        }, { threshold: 0.5 });
+        document.querySelectorAll('.brink-ot-block').forEach(function (el) { observer.observe(el); });
+    });
+    </script>
     <?php
     return ob_get_clean();
 }
 add_shortcode('openingstijden_prijzen', 'brink_frontend_openingstijden');
+
+// AJAX-handler die de "interesse per dag/thema"-view verwerkt (feature 16). Rate-limited en
+// per bezoeker/dag/dag-thema gedupliceerd, zodat dit niet te misbruiken is om tellers op te
+// blazen en de database niet nodeloos belast wordt.
+add_action('wp_ajax_brink_fp_track_day_view', 'brink_fp_track_day_view');
+add_action('wp_ajax_nopriv_brink_fp_track_day_view', 'brink_fp_track_day_view');
+function brink_fp_track_day_view() {
+    if (!check_ajax_referer('brink_fp_ot_track', 'nonce', false)) {
+        wp_send_json_error(null, 403);
+    }
+    if (!brink_fp_rate_limit_check('ot_track', 60, 60)) {
+        wp_send_json_error(null, 429);
+    }
+
+    $day = isset($_POST['day']) ? sanitize_text_field(wp_unslash($_POST['day'])) : '';
+    if (empty($day) || strlen($day) > 200) {
+        wp_send_json_error(null, 400);
+    }
+
+    $dedupe_key = 'brink_ot_view_' . md5(brink_fp_get_client_ip() . '|' . $day);
+    if (!get_transient($dedupe_key)) {
+        set_transient($dedupe_key, 1, DAY_IN_SECONDS);
+        $counts = get_option('brink_openingstijden_views', array());
+        if (!is_array($counts)) $counts = array();
+        if (!isset($counts[$day])) $counts[$day] = 0;
+        $counts[$day]++;
+        update_option('brink_openingstijden_views', $counts);
+    }
+
+    wp_send_json_success();
+}
 
 // Helper CSS
 function brink_render_form_styles($bg_color, $text_color, $primary_color, $btn_color, $btn_hover) {
