@@ -1,15 +1,15 @@
 <?php
 /**
  * Plugin Name: Brink Multimedia Frontend Posting Pro
- * Description: Versie 5.17.0 - Nieuwe functionaliteit: serverside zoeken/paginering in het dashboard, automatische afbeeldingscompressie, een fotogalerij per advertentie, een wekelijkse digest-mail, interesse-tracking per dag/thema, en automatische SEO meta/OG-tags.
- * Version: 5.17.0
+ * Description: Versie 5.17.1 - Nazorg op v5.17.0: whitelist-validatie op de dag/thema-tracker, autoload uitgezet voor veelgeschreven optie, zoekfilter beperkt tot dashboardquery's, en ontbrekende opties toegevoegd aan de uninstall-opruiming.
+ * Version: 5.17.1
  * Author: Brink Multimedia
  * Update URI: false
  */
 
 if (!defined('ABSPATH')) exit;
 
-define('BRINK_FP_VERSION', '5.17.0');
+define('BRINK_FP_VERSION', '5.17.1');
 define('BRINK_FP_DB_VERSION', '1.1');
 define('BRINK_FP_GITHUB_REPO', 'Brinkmulti/frontend-posting-pro');
 
@@ -212,7 +212,7 @@ function brink_fp_prune_old_stats() {
     $wpdb->query($wpdb->prepare("DELETE FROM $table WHERE created_at < DATE_SUB(NOW(), INTERVAL %d DAY)", $retention_days));
 }
 
-// FUNCTIONALITEIT (v5.17.0): wekelijkse digest-mail naar de beheerder met een overzicht van de
+// FUNCTIONALITEIT (v5.17.1): wekelijkse digest-mail naar de beheerder met een overzicht van de
 // afgelopen 7 dagen — zelfde soort functionaliteit als de wekelijkse stats-mail in
 // wp-realtime-analytics, hier toegepast op de formulierinzendingen van deze plugin.
 add_action('brink_fp_weekly_digest_event', 'brink_fp_send_weekly_digest');
@@ -314,9 +314,9 @@ function brink_ad_settings_init() {
     register_setting('brink_ad_advanced_group', 'brink_ad_bump_limit');
     register_setting('brink_ad_advanced_group', 'brink_ad_banned_emails');
     register_setting('brink_ad_advanced_group', 'brink_ad_email_verification_enabled'); // V5.14.2 - E-mail verificatie (Optie 3)
-    register_setting('brink_ad_advanced_group', 'brink_ad_image_max_width'); // V5.17.0 - Max breedte bij compressie/resize
-    register_setting('brink_ad_advanced_group', 'brink_ad_gallery_max_images'); // V5.17.0 - Max aantal galerij-afbeeldingen
-    register_setting('brink_ad_advanced_group', 'brink_fp_weekly_digest_enabled'); // V5.17.0 - Wekelijkse digest-mail aan/uit
+    register_setting('brink_ad_advanced_group', 'brink_ad_image_max_width'); // V5.17.1 - Max breedte bij compressie/resize
+    register_setting('brink_ad_advanced_group', 'brink_ad_gallery_max_images'); // V5.17.1 - Max aantal galerij-afbeeldingen
+    register_setting('brink_ad_advanced_group', 'brink_fp_weekly_digest_enabled'); // V5.17.1 - Wekelijkse digest-mail aan/uit
 
     // Openingstijden & Prijzen 
     register_setting('brink_ad_openingstijden_group', 'brink_openingstijden_data');
@@ -773,7 +773,7 @@ function brink_render_stats_tab() {
     ?>
 
     <?php
-    // FUNCTIONALITEIT (v5.17.0): welk dag/thema uit de Openingstijden & Prijzen-shortcode trekt
+    // FUNCTIONALITEIT (v5.17.1): welk dag/thema uit de Openingstijden & Prijzen-shortcode trekt
     // de meeste interesse (scroll-into-view op de front-end, zie brink_frontend_openingstijden()).
     $day_views = get_option('brink_openingstijden_views', array());
     if (!is_array($day_views)) $day_views = array();
@@ -841,11 +841,13 @@ function brink_display_meta_row($label, $value) {
     echo '<tr><th style="width:200px; padding:10px 0; border-bottom:1px solid #eee;"><strong>' . esc_html($label) . '</strong></th><td style="padding:10px 0; border-bottom:1px solid #eee;">' . wp_kses_post($value) . '</td></tr>';
 }
 
-// FUNCTIONALITEIT (v5.17.0): serverside zoeken + paginering voor het dashboard, ter vervanging
+// FUNCTIONALITEIT (v5.17.1): serverside zoeken + paginering voor het dashboard, ter vervanging
 // van de oude aanpak (élke rij ongepagineerd laden en met JavaScript filteren) — dat schaalde
 // niet meer zodra er veel advertenties/inzendingen zijn. Deze posts_where-filter breidt een
-// WP_Query uit met een titel-OF-metaveld zoekopdracht, maar doet niets zolang de query var leeg is.
-add_filter('posts_where', 'brink_fp_dashboard_search_where', 10, 2);
+// WP_Query uit met een titel-OF-metaveld zoekopdracht.
+// LICHTGEWICHT (v5.17.1): de filter wordt alleen tijdelijk aangehaakt rond de dashboardquery's
+// zelf (zie brink_fp_query_dashboard_section hieronder) i.p.v. permanent op elke WP_Query van
+// de hele site (front-end incluis) te blijven zitten.
 function brink_fp_dashboard_search_where($where, $query) {
     $term = $query->get('brink_search_term');
     if ($term === '' || $term === false) return $where;
@@ -871,11 +873,19 @@ function brink_fp_query_dashboard_section($args, $search_term, $meta_keys, $page
     $args['posts_per_page'] = 5;
     $args['paged'] = max(1, (int) $paged);
     $args['ignore_sticky_posts'] = true;
-    if ($search_term !== '') {
-        $args['brink_search_term'] = $search_term;
-        $args['brink_search_meta_keys'] = $meta_keys;
+
+    if ($search_term === '') {
+        return new WP_Query($args);
     }
-    return new WP_Query($args);
+
+    $args['brink_search_term'] = $search_term;
+    $args['brink_search_meta_keys'] = $meta_keys;
+
+    add_filter('posts_where', 'brink_fp_dashboard_search_where', 10, 2);
+    $query = new WP_Query($args);
+    remove_filter('posts_where', 'brink_fp_dashboard_search_where', 10, 2);
+
+    return $query;
 }
 
 // Print echte (server-rendered) paginatieknoppen voor één dashboard-sectie.
@@ -906,7 +916,7 @@ function brink_render_dashboard_tab() {
     $ervaringen_cat = intval(get_option('brink_ad_ervaringen_category')); $contact_cat = intval(get_option('brink_ad_contact_category')); $inschrijving_cat = intval(get_option('brink_ad_inschrijving_category'));
     $speciale_cats = array_filter(array($ervaringen_cat, $contact_cat, $inschrijving_cat));
 
-    // FUNCTIONALITEIT (v5.17.0): zoekterm + paginanummer per sectie uit de GET-parameters lezen.
+    // FUNCTIONALITEIT (v5.17.1): zoekterm + paginanummer per sectie uit de GET-parameters lezen.
     $search_ads = isset($_GET['search_ads']) ? sanitize_text_field(wp_unslash($_GET['search_ads'])) : '';
     $paged_ads  = isset($_GET['paged_ads']) ? max(1, intval($_GET['paged_ads'])) : 1;
     $search_erv = isset($_GET['search_erv']) ? sanitize_text_field(wp_unslash($_GET['search_erv'])) : '';
@@ -1532,7 +1542,7 @@ function brink_handle_frontend_actions() {
 // ==========================================
 // 5. WEERGAVEN TRACKER & ELEMENTOR CLEANUP
 // ==========================================
-// FUNCTIONALITEIT (v5.17.0): automatische SEO meta description + Open Graph/Twitter-tags voor
+// FUNCTIONALITEIT (v5.17.1): automatische SEO meta description + Open Graph/Twitter-tags voor
 // advertentie- en ervaringsposts, zodat deze er ook zonder los SEO-plugin netjes uitzien bij het
 // delen op social media en in zoekresultaten. Slaat over als er al een bekend SEO-plugin actief
 // is, om dubbele/conflicterende meta-tags te voorkomen.
@@ -1587,7 +1597,7 @@ function brink_track_ad_views() {
     update_post_meta($post->ID, 'ad_views', $views + 1);
 }
 
-// FUNCTIONALITEIT (v5.17.0): ruimt galerij-afbeeldingen op zodra de bijbehorende post ergens
+// FUNCTIONALITEIT (v5.17.1): ruimt galerij-afbeeldingen op zodra de bijbehorende post ergens
 // verwijderd wordt (admin-verwijdering, ban, front-end delete-link, of de expiratie-cron) —
 // één centrale hook i.p.v. dit bij elke afzonderlijke wp_delete_post()-aanroep te herhalen.
 add_action('before_delete_post', 'brink_fp_cleanup_gallery_on_delete');
@@ -1647,7 +1657,7 @@ function brink_force_webp_conversion_and_seo($attachment_id, $ad_title) {
 
     $editor = wp_get_image_editor($new_path);
     if (!is_wp_error($editor)) {
-        // FUNCTIONALITEIT (v5.17.0): automatische compressie/resize naast de WebP-conversie.
+        // FUNCTIONALITEIT (v5.17.1): automatische compressie/resize naast de WebP-conversie.
         // Voorkomt dat bezoekers onnodig grote originele foto's (die de 1MB-uploadcheck net
         // doorstaan, bijv. een kleine bestandsgrootte met hele hoge resolutie) op de site zetten.
         $max_width = (int) get_option('brink_ad_image_max_width', 1600);
@@ -1670,7 +1680,7 @@ function brink_force_webp_conversion_and_seo($attachment_id, $ad_title) {
 }
 
 // Helper: Kopieer originele placeholder, maak hem uniek, converteer & assign
-// FUNCTIONALITEIT (v5.17.0): verwerkt meerdere galerij-afbeeldingen naast de hoofdfoto van een
+// FUNCTIONALITEIT (v5.17.1): verwerkt meerdere galerij-afbeeldingen naast de hoofdfoto van een
 // advertentie. Ongeldige bestanden (te groot, verkeerd type) worden individueel overgeslagen
 // i.p.v. de hele inzending te blokkeren — de hoofdfoto blijft leidend voor validatiefouten.
 function brink_fp_handle_ad_gallery_upload($post_id, $seo_base_name) {
@@ -1921,7 +1931,7 @@ function brink_frontend_ad_form() {
                     brink_assign_placeholder_copy($post_id, $seo_img_name);
                 }
 
-                // FUNCTIONALITEIT (v5.17.0): galerij-afbeeldingen naast de hoofdfoto verwerken.
+                // FUNCTIONALITEIT (v5.17.1): galerij-afbeeldingen naast de hoofdfoto verwerken.
                 // Bij een bewerking vervangt een nieuwe galerij-upload de oude (die wordt eerst
                 // opgeruimd, consistent met hoe de hoofdfoto bij een update wordt vervangen).
                 $new_gallery_ids = brink_fp_handle_ad_gallery_upload($post_id, $seo_img_name);
@@ -2372,7 +2382,7 @@ function brink_frontend_openingstijden() {
     </div>
     <script>
     document.addEventListener('DOMContentLoaded', function () {
-        // FUNCTIONALITEIT (v5.17.0): meet per dag/thema hoeveel bezoekers dat blok daadwerkelijk
+        // FUNCTIONALITEIT (v5.17.1): meet per dag/thema hoeveel bezoekers dat blok daadwerkelijk
         // te zien krijgen (scroll-into-view), zodat de beheerder kan zien welk dag/thema de
         // meeste interesse trekt. Eén melding per dag/thema per bezoeker per dag (dedupe serverside).
         if (!('IntersectionObserver' in window)) return;
@@ -2419,6 +2429,16 @@ function brink_fp_track_day_view() {
         wp_send_json_error(null, 400);
     }
 
+    // BEVEILIGING (v5.17.1): alleen dag/thema-labels tellen die daadwerkelijk in de
+    // Openingstijden & Prijzen-instellingen staan. Zonder deze whitelist-check kon een
+    // aanvraag met een zelfverzonnen "day"-waarde de dedupe (per IP + dagtekst) omzeilen en
+    // de brink_openingstijden_views-optie onbeperkt laten groeien.
+    $configured_data = json_decode(get_option('brink_openingstijden_data'), true);
+    $configured_days = is_array($configured_data) ? wp_list_pluck($configured_data, 'day') : array();
+    if (!in_array($day, $configured_days, true)) {
+        wp_send_json_error(null, 400);
+    }
+
     $dedupe_key = 'brink_ot_view_' . md5(brink_fp_get_client_ip() . '|' . $day);
     if (!get_transient($dedupe_key)) {
         set_transient($dedupe_key, 1, DAY_IN_SECONDS);
@@ -2426,7 +2446,12 @@ function brink_fp_track_day_view() {
         if (!is_array($counts)) $counts = array();
         if (!isset($counts[$day])) $counts[$day] = 0;
         $counts[$day]++;
-        update_option('brink_openingstijden_views', $counts);
+        // BEVEILIGING/LICHTGEWICHT (v5.17.1): autoload=false — deze optie wordt vaak
+        // geschreven (bij elke unieke bezoeker/dag-combinatie) maar alleen uitgelezen op het
+        // Statistieken-tabblad in wp-admin. Als autoloaded optie zou hij op élke paginalading
+        // van de hele site worden meegeladen en zou elke write de volledige alloptions-cache
+        // invalideren.
+        update_option('brink_openingstijden_views', $counts, false);
     }
 
     wp_send_json_success();
@@ -2580,6 +2605,7 @@ function brink_fp_uninstall() {
         'brink_turnstile_sitekey', 'brink_turnstile_secret', 'brink_ad_placeholder_image', 'brink_ad_bump_enabled', 'brink_ad_bump_limit',
         'brink_ad_banned_emails', 'brink_ad_email_verification_enabled',
         'brink_openingstijden_data', 'brink_fp_db_version',
+        'brink_ad_image_max_width', 'brink_ad_gallery_max_images', 'brink_fp_weekly_digest_enabled', 'brink_openingstijden_views',
     );
     foreach ($brink_fp_options as $brink_fp_option) {
         delete_option($brink_fp_option);
